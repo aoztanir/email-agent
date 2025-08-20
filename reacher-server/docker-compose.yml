@@ -1,0 +1,28 @@
+version: "3.8"
+
+services:
+  reacher:
+    image: reacherhq/backend:latest
+    container_name: reacher-server
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Logging level: trace, debug, info, warn, error
+      RUST_LOG: info
+
+      # Timeout for SMTP checks in seconds
+      REACHER_SMTP_TIMEOUT: 15
+
+      # How many retries to attempt for SMTP verification
+      REACHER_SMTP_RETRIES: 1
+
+      # Example: override default "from" email during checks
+      # REACHER_FROM_EMAIL: "hello@localhost"
+
+      # Example: force a proxy globally (instead of per-request)
+      # REACHER_PROXY_HOST: "127.0.0.1"
+      # REACHER_PROXY_PORT: "9050"
+
+    volumes:
+      - ./data:/app/data
