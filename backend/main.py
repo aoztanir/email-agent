@@ -3,23 +3,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import json
+import asyncio
+import logging
+from typing import List, Optional, Dict, Any
 from services.maps_scraper import GoogleMapsScraper
 from services.reacher_email_validator import ReacherEmailValidator
+from services.searxng_scraper import SearxngScraper
+from services.contact_service import ContactService
 from database.supabase_client import get_supabase_client
 from utils.domain_utils import normalize_domain
 import uuid
-import asyncio
-import logging
-from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Email Mining API", version="1.0.0")
+app = FastAPI(title="Email Mining API - Clean", version="2.1.0")
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],  # Next.js dev server
+    allow_origins=["http://localhost:3000", "http://localhost:3001"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -28,32 +30,290 @@ app.add_middleware(
 # Initialize services
 maps_scraper = GoogleMapsScraper()
 
-class SearchCompaniesRequest(BaseModel):
+class StreamSearchRequest(BaseModel):
     query: str
     total: int = 20
-
-class MineEmailsRequest(BaseModel):
-    company_id: str
-    company_name: str
-    website: str
 
 class ValidateEmailRequest(BaseModel):
     email: str
     proxy: Optional[dict] = None
 
-class ValidateEmailsBatchRequest(BaseModel):
-    emails: List[str]
-    proxy: Optional[dict] = None
+# Email providers that block validation
+BLOCKED_EMAIL_DOMAINS = {
+    'gmail.com', 'outlook.com', 'hotmail.com', 'yahoo.com', 'icloud.com',
+    'live.com', 'msn.com', 'aol.com', 'protonmail.com', 'mail.com'
+}
 
-class FindEmailRequest(BaseModel):
-    first_name: str
-    last_name: Optional[str] = None
-    company_website: str
-    validate: bool = True
+def is_blocked_domain(domain: str) -> bool:
+    """Check if email domain blocks validation"""
+    return domain.lower() in BLOCKED_EMAIL_DOMAINS
+
+def generate_email_patterns(first_name: str, last_name: str, domain: str) -> List[str]:
+    """Generate common email patterns for a person"""
+    first = first_name.lower().strip()
+    last = last_name.lower().strip() if last_name else ""
+    
+    patterns = []
+    if last:
+        patterns.extend([
+            f"{first}.{last}@{domain}",
+            f"{first}@{domain}",
+            f"{first}{last}@{domain}",
+            f"{first[0]}{last}@{domain}",
+            f"{first}{last[0]}@{domain}"
+        ])
+    else:
+        patterns.append(f"{first}@{domain}")
+    
+    return patterns
+
+async def find_existing_companies(query: str) -> List[Dict[str, Any]]:
+    """Fast search for existing companies in database"""
+    try:
+        supabase = get_supabase_client()
+        
+        # Search by company name (case insensitive)
+        response = supabase.table('scraped_company').select('*').ilike('name', f'%{query}%').limit(10).execute()
+        
+        existing_companies = []
+        for company in response.data:
+            existing_companies.append({
+                'id': company['id'],
+                'name': company['name'],
+                'website': company['website'],
+                'address': company['address'],
+                'phone_number': company['phone_number'],
+                'is_existing': True
+            })
+        
+        return existing_companies
+    except Exception as e:
+        logger.error(f"Error searching existing companies: {e}")
+        return []
 
 @app.get("/")
 async def root():
-    return {"message": "Email Mining API is running"}
+    return {"message": "Email Mining API - Clean Version is running"}
+
+@app.post("/stream-search")
+async def stream_search(request: StreamSearchRequest):
+    """Main endpoint: Stream company discovery with real-time contact finding and email validation"""
+    
+    async def generate_search_stream():
+        try:
+            # Step 1: Send initial status
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Starting search...', 'stage': 'initializing'})}\n\n"
+            
+            # Step 2: Search existing companies first (fast)
+            existing_companies = await find_existing_companies(request.query)
+            if existing_companies:
+                yield f"data: {json.dumps({'type': 'existing_companies', 'companies': existing_companies, 'count': len(existing_companies)})}\n\n"
+                
+                # Send existing contacts for these companies immediately
+                contact_service = ContactService()
+                for company in existing_companies:
+                    existing_contacts = contact_service.get_contacts_by_company(company['id'])
+                    for contact in existing_contacts:
+                        if contact.get('emails'):  # Only send contacts with confirmed emails
+                            contact_data = {
+                                'id': str(contact['id']),
+                                'first_name': contact['first_name'],
+                                'last_name': contact['last_name'] or '',
+                                'emails': contact.get('emails', []),
+                                'company_id': company['id'],
+                                'company_name': company['name']
+                            }
+                            yield f"data: {json.dumps({'type': 'contact_found', 'contact': contact_data, 'company_id': company['id']})}\n\n"
+            
+            # Step 3: Scrape new companies from Google Maps
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Discovering new companies...', 'stage': 'scraping'})}\n\n"
+            
+            companies = await maps_scraper.scrape_places(request.query, request.total)
+            companies_with_websites = [
+                company for company in companies 
+                if company.get('website') and company.get('website').strip()
+            ]
+            
+            # Step 4: Save companies to database and send immediately
+            supabase = get_supabase_client()
+            prompt_data = {
+                "query_text": request.query,
+                "total_requested": request.total,
+                "total_found": len(companies_with_websites)
+            }
+            
+            prompt_result = supabase.table('prompt').insert([prompt_data]).execute()
+            prompt_id = prompt_result.data[0]['id'] if prompt_result.data else None
+            
+            new_companies = []
+            for company in companies_with_websites:
+                try:
+                    website = company.get('website', '')
+                    normalized_domain = normalize_domain(website)
+                    
+                    if not normalized_domain:
+                        continue
+                    
+                    scraped_company_data = {
+                        "name": company.get('name', ''),
+                        "address": company.get('address', ''),
+                        "website": website,
+                        "normalized_domain": normalized_domain,
+                        "phone_number": company.get('phone_number', ''),
+                        "reviews_count": company.get('reviews_count'),
+                        "reviews_average": company.get('reviews_average'),
+                        "store_shopping": company.get('store_shopping', 'No'),
+                        "in_store_pickup": company.get('in_store_pickup', 'No'),
+                        "store_delivery": company.get('store_delivery', 'No'),
+                        "place_type": company.get('place_type', ''),
+                        "opens_at": company.get('opens_at', ''),
+                        "introduction": company.get('introduction', '')
+                    }
+                    
+                    company_result = supabase.table('scraped_company').upsert([scraped_company_data], on_conflict='normalized_domain').execute()
+                    
+                    if company_result.data:
+                        company_id = company_result.data[0]['id']
+                        company_with_id = {**company, "id": company_id, "is_existing": False}
+                        new_companies.append(company_with_id)
+                        
+                        # Send company immediately to frontend
+                        yield f"data: {json.dumps({'type': 'company_found', 'company': company_with_id})}\n\n"
+                        
+                        if prompt_id:
+                            link_data = {"prompt_id": prompt_id, "scraped_company_id": company_id}
+                            supabase.table('prompt_to_scraped_company').upsert([link_data], on_conflict='prompt_id,scraped_company_id').execute()
+                
+                except Exception as e:
+                    logger.error(f"Error saving company {company.get('name', 'Unknown')}: {e}")
+                    continue
+            
+            # Step 5: Start contact discovery for new companies only
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Discovering contacts and emails...', 'stage': 'discovery'})}\n\n"
+            
+            # Initialize services
+            scraper = SearxngScraper()
+            contact_service = ContactService()
+            
+            # Process new companies for contact mining
+            for company in new_companies:
+                company_id = company['id']
+                company_name = company['name']
+                website = company['website']
+                domain = normalize_domain(website)
+                
+                try:
+                    yield f"data: {json.dumps({'type': 'status', 'message': f'Finding contacts for {company_name}...', 'company_id': company_id})}\n\n"
+                    
+                    # Find contacts
+                    scrape_result = scraper.scrape_company_contacts(
+                        company_id=company_id,
+                        company_name=company_name,
+                        limit=5,
+                        max_pages=1
+                    )
+                    
+                    # Get the newly found contacts
+                    contacts = contact_service.get_contacts_by_company(company_id)
+                    logger.info(f"Retrieved {len(contacts)} contacts for {company_name}")
+                    
+                    # Process each contact for email validation
+                    for contact in contacts:
+                        first_name = contact['first_name']
+                        last_name = contact['last_name'] or ''
+                        
+                        # Check if domain blocks email validation
+                        if is_blocked_domain(domain):
+                            # Generate most likely email pattern (no validation)
+                            patterns = generate_email_patterns(first_name, last_name, domain)
+                            if patterns:
+                                best_email = patterns[0]  # Use most common pattern
+                                
+                                # Save unvalidated email
+                                contact_email_data = {
+                                    'contact_id': str(contact['id']),
+                                    'email': best_email,
+                                    'confidence': 'pattern_generated',
+                                    'is_deliverable': None,  # Cannot validate
+                                    'validation_result': {'blocked_domain': True, 'pattern': 'most_likely'}
+                                }
+                                
+                                try:
+                                    supabase.table('contact_email').insert([contact_email_data]).execute()
+                                    
+                                    # Send to frontend
+                                    contact_data = {
+                                        'id': str(contact['id']),
+                                        'first_name': first_name,
+                                        'last_name': last_name,
+                                        'emails': [{'email': best_email, 'confidence': 'pattern_generated', 'is_deliverable': None}],
+                                        'company_id': company_id,
+                                        'company_name': company_name
+                                    }
+                                    logger.info(f"Sending pattern email contact to frontend: {first_name} {last_name} - {best_email}")
+                                    yield f"data: {json.dumps({'type': 'contact_found', 'contact': contact_data, 'company_id': company_id})}\n\n"
+                                    
+                                except Exception as e:
+                                    logger.error(f"Error saving pattern email for {first_name} {last_name}: {e}")
+                        
+                        else:
+                            # Use localhost:8080 API for validation
+                            patterns = generate_email_patterns(first_name, last_name, domain)
+                            
+                            async with ReacherEmailValidator() as validator:
+                                for pattern in patterns[:2]:  # Check top 2 patterns
+                                    try:
+                                        validation_result = await validator.validate_email(pattern)
+                                        
+                                        if validation_result.get('is_deliverable'):
+                                            # Save validated email
+                                            contact_email_data = {
+                                                'contact_id': str(contact['id']),
+                                                'email': pattern,
+                                                'confidence': validation_result.get('confidence', 'unknown'),
+                                                'is_deliverable': validation_result.get('is_deliverable'),
+                                                'validation_result': validation_result
+                                            }
+                                            
+                                            try:
+                                                supabase.table('contact_email').insert([contact_email_data]).execute()
+                                                
+                                                # Send validated email to frontend
+                                                contact_data = {
+                                                    'id': str(contact['id']),
+                                                    'first_name': first_name,
+                                                    'last_name': last_name,
+                                                    'emails': [{'email': pattern, 'confidence': validation_result.get('confidence'), 'is_deliverable': True}],
+                                                    'company_id': company_id,
+                                                    'company_name': company_name
+                                                }
+                                                logger.info(f"Sending validated email contact to frontend: {first_name} {last_name} - {pattern}")
+                                                yield f"data: {json.dumps({'type': 'contact_found', 'contact': contact_data, 'company_id': company_id})}\n\n"
+                                                break  # Found valid email, stop checking patterns
+                                                
+                                            except Exception as e:
+                                                logger.error(f"Error saving validated email for {first_name} {last_name}: {e}")
+                                                
+                                    except Exception as e:
+                                        logger.error(f"Error validating email {pattern}: {e}")
+                                        continue
+                    
+                    # Small delay between companies
+                    await asyncio.sleep(0.1)
+                        
+                except Exception as e:
+                    logger.error(f"Error processing company {company_name}: {e}")
+                    yield f"data: {json.dumps({'type': 'error', 'company_id': company_id, 'message': str(e)})}\n\n"
+            
+            # Send completion
+            total_companies = len(existing_companies) + len(new_companies)
+            yield f"data: {json.dumps({'type': 'complete', 'total_companies': total_companies, 'existing_companies': len(existing_companies), 'new_companies': len(new_companies)})}\n\n"
+            
+        except Exception as e:
+            logger.error(f"Error in stream search: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+    
+    return StreamingResponse(generate_search_stream(), media_type="text/stream")
 
 @app.post("/validate-email")
 async def validate_email(request: ValidateEmailRequest):
@@ -69,411 +329,33 @@ async def validate_email(request: ValidateEmailRequest):
         logger.error(f"Error validating email {request.email}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/validate-emails-batch")
-async def validate_emails_batch(request: ValidateEmailsBatchRequest):
-    """Validate multiple email addresses using Reacher API"""
-    try:
-        if not request.emails:
-            raise HTTPException(status_code=400, detail="No emails provided")
-        
-        async with ReacherEmailValidator() as validator:
-            results = await validator.validate_emails_batch(request.emails, request.proxy)
-            
-            # Separate results by status
-            confirmed = [r for r in results if r['confidence'] == 'confirmed']
-            unconfirmed = [r for r in results if r['confidence'] == 'unconfirmed']
-            invalid = [r for r in results if r['confidence'] == 'invalid']
-            risky = [r for r in results if r['confidence'] in ['risky', 'unknown']]
-            
-            return {
-                "success": True,
-                "total_processed": len(results),
-                "confirmed": len(confirmed),
-                "unconfirmed": len(unconfirmed),
-                "invalid": len(invalid),
-                "risky": len(risky),
-                "results": results,
-                "summary": {
-                    "confirmed_emails": confirmed,
-                    "unconfirmed_emails": unconfirmed,
-                    "invalid_emails": invalid,
-                    "risky_emails": risky
-                }
-            }
-    except Exception as e:
-        logger.error(f"Error validating email batch: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/find-email")
-async def find_email(request: FindEmailRequest):
-    """Find and optionally validate the most likely email for a person"""
-    try:
-        async with ReacherEmailValidator() as validator:
-            # Generate most likely email pattern
-            likely_email = validator.find_likely_email(
-                request.first_name, 
-                request.last_name, 
-                request.company_website
-            )
-            
-            if not likely_email:
-                return {
-                    "success": False,
-                    "error": "Could not generate email pattern",
-                    "first_name": request.first_name,
-                    "last_name": request.last_name,
-                    "company_website": request.company_website
-                }
-            
-            result = {
-                "success": True,
-                "generated_email": likely_email,
-                "first_name": request.first_name,
-                "last_name": request.last_name,
-                "company_website": request.company_website
-            }
-            
-            # Validate the email if requested
-            if request.validate:
-                validation_result = await validator.validate_email(likely_email)
-                result["validation"] = validation_result
-                result["is_deliverable"] = validation_result.get('is_deliverable')
-                result["confidence"] = validation_result.get('confidence')
-                result["status"] = validation_result.get('status')
-            
-            return result
-            
-    except Exception as e:
-        logger.error(f"Error finding email for {request.first_name} {request.last_name}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/search-companies")
-async def search_companies(request: SearchCompaniesRequest):
-    """Search for companies using Google Maps scraper and automatically save companies with domains"""
-    try:
-        # 1. Scrape companies from Google Maps
-        companies = await maps_scraper.scrape_places(request.query, request.total)
-        
-        # 2. Filter companies with websites only
-        companies_with_websites = [
-            company for company in companies 
-            if company.get('website') and company.get('website').strip()
-        ]
-        
-        # 3. Create prompt record in database
-        supabase = get_supabase_client()
-        prompt_data = {
-            "query_text": request.query,
-            "total_requested": request.total,
-            "total_found": len(companies_with_websites)
-        }
-        
-        prompt_result = supabase.table('prompt').insert([prompt_data]).execute()
-        if not prompt_result.data:
-            raise Exception("Failed to create prompt record")
-        
-        prompt_id = prompt_result.data[0]['id']
-        
-        # 4. Save scraped companies with websites to database
-        saved_companies = []
-        for company in companies_with_websites:
-            try:
-                # Normalize the domain for deduplication
-                website = company.get('website', '')
-                normalized_domain = normalize_domain(website)
-                
-                if not normalized_domain:
-                    print(f"Skipping company {company.get('name', 'Unknown')} - no valid domain")
-                    continue
-                
-                # Prepare company data for database (no place_id needed)
-                scraped_company_data = {
-                    "name": company.get('name', ''),
-                    "address": company.get('address', ''),
-                    "website": website,
-                    "normalized_domain": normalized_domain,
-                    "phone_number": company.get('phone_number', ''),
-                    "reviews_count": company.get('reviews_count'),
-                    "reviews_average": company.get('reviews_average'),
-                    "store_shopping": company.get('store_shopping', 'No'),
-                    "in_store_pickup": company.get('in_store_pickup', 'No'),
-                    "store_delivery": company.get('store_delivery', 'No'),
-                    "place_type": company.get('place_type', ''),
-                    "opens_at": company.get('opens_at', ''),
-                    "introduction": company.get('introduction', '')
-                }
-                
-                # Upsert scraped company using normalized_domain for deduplication
-                company_result = supabase.table('scraped_company').upsert([scraped_company_data], on_conflict='normalized_domain').execute()
-                
-                if company_result.data:
-                    company_id = company_result.data[0]['id']
-                    
-                    # Link prompt to scraped company
-                    link_data = {
-                        "prompt_id": prompt_id,
-                        "scraped_company_id": company_id
-                    }
-                    
-                    # Use upsert to avoid duplicate key errors
-                    supabase.table('prompt_to_scraped_company').upsert([link_data], on_conflict='prompt_id,scraped_company_id').execute()
-                    
-                    # Add the company ID to the company data for frontend use
-                    company_with_id = {**company, "id": company_id}
-                    saved_companies.append(company_with_id)
-                    
-            except Exception as e:
-                print(f"Error saving company {company.get('name', 'Unknown')}: {e}")
-                # Continue with other companies even if one fails
-                continue
-        
-        # Return the saved companies with IDs for frontend use
-        return {
-            "companies": saved_companies if saved_companies else companies_with_websites,
-            "total_found": len(companies_with_websites),
-            "saved_to_db": len(saved_companies),
-            "prompt_id": prompt_id
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/search-and-mine")
-async def search_and_mine(request: SearchCompaniesRequest):
-    """Simplified endpoint that searches companies and automatically mines emails for all companies"""
-    try:
-        from services.searxng_scraper import SearxngScraper
-        from services.contact_service import ContactService
-        
-        # 1. Search and save companies (reuse existing logic)
-        search_result = await search_companies(request)
-        companies = search_result["companies"]
-        
-        if not companies:
-            return {
-                "companies": [],
-                "company_stats": {},
-                "total_found": 0,
-                "prompt_id": search_result["prompt_id"]
-            }
-        
-        # 2. Initialize services for email mining
-        scraper = SearxngScraper()
-        contact_service = ContactService()
-        company_stats = {}
-        
-        # 3. Mine emails for all companies automatically
-        for company in companies:
-            company_id = company.get('id')
-            company_name = company.get('name', '')
-            
-            try:
-                # Check if contacts already exist
-                existing_contacts = contact_service.get_contacts_by_company(company_id)
-                
-                if not existing_contacts:
-                    # Mine new contacts
-                    scrape_result = scraper.scrape_company_contacts(
-                        company_id=company_id,
-                        company_name=company_name,
-                        limit=10,
-                        max_pages=2
-                    )
-                    contacts_created = scrape_result["contacts_created"]
-                    emails_found = scrape_result["emails_found"]
-                else:
-                    # Use existing contacts
-                    contacts_created = len(existing_contacts)
-                    emails_found = sum(1 for contact in existing_contacts if hasattr(contact, 'email') and contact.email)
-                
-                # Get final contact data for response
-                final_contacts = contact_service.get_contacts_by_company(company_id)
-                
-                company_stats[company_id] = {
-                    "contactCount": len(final_contacts),
-                    "emailCount": sum(len(contact.get('emails', [])) for contact in final_contacts),
-                    "contacts": final_contacts
-                }
-                
-            except Exception as e:
-                print(f"Error mining emails for {company_name}: {e}")
-                company_stats[company_id] = {
-                    "contactCount": 0,
-                    "emailCount": 0,
-                    "contacts": []
-                }
-        
-        return {
-            "companies": companies,
-            "company_stats": company_stats,
-            "total_found": search_result["total_found"],
-            "prompt_id": search_result["prompt_id"]
-        }
-        
-    except Exception as e:
-        print(f"Error in search-and-mine: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/mine-emails")
-async def mine_emails(request: MineEmailsRequest):
-    """Mine emails and contacts for a specific company using SearXNG scraper"""
-    try:
-        from services.searxng_scraper import SearxngScraper
-        from services.contact_service import ContactService
-        
-        # Initialize the SearXNG scraper
-        scraper = SearxngScraper()
-        contact_service = ContactService()
-        
-        # Add small delay to show loading
-        await asyncio.sleep(0.5)
-        
-        # Check if contacts already exist for this scraped company
-        existing_contacts = contact_service.get_contacts_by_company(request.company_id)
-        
-        if not existing_contacts:
-            print(f"Scraping LinkedIn contacts for company: {request.company_name}")
-            
-            # Use SearXNG to find real LinkedIn contacts
-            scrape_result = scraper.scrape_company_contacts(
-                company_id=request.company_id,
-                company_name=request.company_name,
-                limit=10,  # Find up to 10 contacts per company
-                max_pages=2
-            )
-            
-            contacts_created = scrape_result["contacts_created"]
-            emails_found = scrape_result["emails_found"]
-            
-            print(f"SearXNG scraper found {contacts_created} contacts and {emails_found} emails")
-            
-        else:
-            # If contacts exist, just count them
-            contacts_created = len(existing_contacts)
-            # Count existing emails
-            emails_found = sum(1 for contact in existing_contacts if hasattr(contact, 'email') and contact.email)
-            print(f"Found existing {contacts_created} contacts with {emails_found} emails")
-        
-        return {
-            "success": True,
-            "company_name": request.company_name,
-            "website": request.website,
-            "contacts_found": emails_found,
-            "total_contacts": contacts_created,
-            "message": f"Successfully found {emails_found} valid emails from {contacts_created} LinkedIn contacts for {request.company_name}"
-        }
-        
-    except Exception as e:
-        print(f"Error in mine_emails: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/get-contacts/{company_id}")
 async def get_contacts(company_id: str):
     """Get all contacts with emails for a specific company"""
     try:
-        from services.contact_service import ContactService
         contact_service = ContactService()
         contacts = contact_service.get_contacts_by_company(company_id)
+        
+        # Filter to only include contacts with confirmed emails
+        confirmed_contacts = [
+            contact for contact in contacts 
+            if contact.get('emails') and any(
+                email.get('is_deliverable') is True or email.get('confidence') == 'pattern_generated'
+                for email in contact.get('emails', [])
+            )
+        ]
         
         return {
             "success": True,
             "company_id": company_id,
-            "contacts": contacts,
-            "total_contacts": len(contacts),
-            "total_emails": sum(len(contact.get('emails', [])) for contact in contacts)
+            "contacts": confirmed_contacts,
+            "total_contacts": len(confirmed_contacts),
+            "total_emails": sum(len(contact.get('emails', [])) for contact in confirmed_contacts)
         }
     except Exception as e:
-        print(f"Error fetching contacts for company {company_id}: {e}")
+        logger.error(f"Error fetching contacts for company {company_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/batch-mine-emails-stream")
-async def batch_mine_emails_stream(companies: List[dict]):
-    """Stream real-time updates for batch email mining"""
-    
-    async def generate_mining_updates():
-        try:
-            from services.searxng_scraper import SearxngScraper
-            
-            scraper = SearxngScraper()
-            total_companies = len(companies)
-            total_contacts = 0
-            total_emails = 0
-            
-            # Send initial status
-            yield f"data: {json.dumps({'type': 'status', 'message': 'Starting email mining process', 'progress': 0, 'current_company': 0, 'total_companies': total_companies})}\n\n"
-            
-            for i, company in enumerate(companies):
-                company_id = company.get('id')
-                company_name = company.get('name')
-                company_website = company.get('website', '')
-                
-                # Send company progress update
-                progress = (i / total_companies) * 100
-                yield f"data: {json.dumps({'type': 'company_progress', 'company_name': company_name, 'progress': progress, 'current_company': i + 1, 'total_companies': total_companies})}\n\n"
-                
-                try:
-                    # Mine contacts for this company
-                    result = scraper.scrape_company_contacts(
-                        company_id=company_id,
-                        company_name=company_name,
-                        limit=10,
-                        max_pages=2
-                    )
-                    
-                    contacts_found = result.get('contacts_created', 0)
-                    emails_found = result.get('emails_found', 0)
-                    
-                    total_contacts += contacts_found
-                    total_emails += emails_found
-                    
-                    # Send company completion with real-time email data
-                    yield f"data: {json.dumps({'type': 'company_complete', 'company_id': company_id, 'company_name': company_name, 'contacts_found': contacts_found, 'emails_found': emails_found, 'progress': progress})}\n\n"
-                    
-                    # If we found contacts, send email details
-                    if contacts_found > 0:
-                        # Get the actual contact and email data to send to frontend
-                        from services.contact_service import ContactService
-                        contact_service = ContactService()
-                        contacts = contact_service.get_contacts_by_company(company_id)
-                        
-                        for contact in contacts[:5]:  # Send first 5 for real-time display
-                            contact_emails = []
-                            if contact.get('emails'):
-                                for email_obj in contact['emails']:
-                                    email_data = {
-                                        'email': email_obj.get('email', ''),
-                                        'confidence': 'medium',  # Default confidence since we don't store it in DB
-                                        'is_deliverable': email_obj.get('is_deliverable', True)
-                                    }
-                                    contact_emails.append(email_data)
-                            
-                            contact_data = {
-                                'id': str(contact['id']),
-                                'first_name': contact['first_name'],
-                                'last_name': contact['last_name'] or '',
-                                'emails': contact_emails,
-                                'company_name': company_name
-                            }
-                            
-                            yield f"data: {json.dumps({'type': 'contact_found', 'contact': contact_data, 'company_id': company_id})}\n\n"
-                    
-                    # Small delay between companies
-                    await asyncio.sleep(0.5)
-                    
-                except Exception as e:
-                    print(f"Error processing company {company_name}: {e}")
-                    yield f"data: {json.dumps({'type': 'company_error', 'company_name': company_name, 'error': str(e)})}\n\n"
-                    continue
-            
-            # Send final completion
-            yield f"data: {json.dumps({'type': 'complete', 'total_contacts': total_contacts, 'total_emails': total_emails, 'companies_processed': total_companies})}\n\n"
-            
-        except Exception as e:
-            print(f"Error in streaming mining: {e}")
-            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
-    
-    return StreamingResponse(generate_mining_updates(), media_type="text/stream")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main_clean:app", host="0.0.0.0", port=8000, reload=True)

@@ -43,7 +43,7 @@ class ContactService:
         """Get all contacts for a specific company with their emails"""
         try:
             # Query contacts with their associated emails
-            result = self.supabase.table("contact").select("*, contact_email(id, email, is_valid, is_deliverable, found_by)").eq("company_id", company_id).execute()
+            result = self.supabase.table("contact").select("*, contact_email(id, email, is_valid, is_deliverable, found_by, confidence, validation_result)").eq("company_id", company_id).execute()
             
             # Transform the data to include emails array
             contacts_with_emails = []

@@ -1,5 +1,5 @@
 import os
-from supabase import create_client, Client
+from supabase import create_client, create_async_client, Client, AsyncClient
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -12,6 +12,15 @@ def get_supabase_client() -> Client:
         raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in environment variables")
     
     return create_client(url, key)
+
+def get_supabase_async_client() -> AsyncClient:
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_KEY")
+    
+    if not url or not key:
+        raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in environment variables")
+    
+    return create_async_client(url, key)
 
 def get_supabase_service_client() -> Client:
     url = os.getenv("SUPABASE_URL")
